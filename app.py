@@ -1,80 +1,168 @@
-import streamlit as st
-import os
 import sys
-import torch
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
+import os
 import io
+import numpy as np
+import streamlit as st
+from PIL import Image
+import torch
+import torch.nn.functional as F
+import torchvision.transforms as T
 
-# Add project root to Python path for module imports
-project_root = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, project_root)
+# ── paths ────────────────────────────────────────────────────────────────────
+ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+CAP_DIR  = os.path.join(ROOT_DIR, "Image Captioning")
+SEG_DIR  = os.path.join(ROOT_DIR, "Image Segmentation")
+sys.path.insert(0, CAP_DIR)
 
-# Import your modules
-from caption import generate_caption, encoder, decoder, word2idx, idx2word, image_transform, device
-from segment import predict_and_visualize_cv2, model as seg_model
+from data_loader import FlickrDataset
+from generate_caption import EncoderDecoder, load_model, generate_caption
 
+# ── device ───────────────────────────────────────────────────────────────────
+def get_device():
+    if torch.cuda.is_available():   return torch.device("cuda")
+    if torch.backends.mps.is_available(): return torch.device("mps")
+    return torch.device("cpu")
+
+device = get_device()
+
+# ── sample images ─────────────────────────────────────────────────────────────
+SAMPLE_DIR  = os.path.join(ROOT_DIR, "sample_images")
+CAP_SAMPLE  = os.path.join(SAMPLE_DIR, "captioning")
+SEG_SAMPLE  = os.path.join(SAMPLE_DIR, "segmentation")
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png"}
+
+def list_images(folder):
+    return sorted(f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in _IMG_EXTS)
+
+# ── loaders (cached) ──────────────────────────────────────────────────────────
+@st.cache_resource
+def load_caption_model():
+    cap_transform = T.Compose([
+        T.Resize(226), T.CenterCrop(224), T.ToTensor(),
+        T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    dataset = FlickrDataset(
+        root_dir=os.path.join(CAP_DIR, "archive/Images"),
+        caption_file=os.path.join(CAP_DIR, "archive/captions.txt"),
+        transform=cap_transform,
+    )
+    model = load_model(os.path.join(CAP_DIR, "attention_model_state.pth"), dataset.vocab)
+    return model, dataset.vocab, cap_transform
+
+@st.cache_resource
+def load_seg_model():
+    model = torch.load(
+        os.path.join(SEG_DIR, "Unet-Mobilenet_v2_mIoU-0.227.pt"),
+        map_location=device,
+        weights_only=False
+    )
+    model.to(device)
+    model.eval()
+    return model
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+def run_caption(pil_img):
+    model, vocab, transform = load_caption_model()
+    img_tensor = transform(pil_img.convert("RGB")).unsqueeze(0).to(device)
+    with torch.no_grad():
+        features = model.encoder(img_tensor)
+        caps, _ = model.decoder.generate_caption(features, vocab=vocab)
+    words = [w for w in caps if w not in ("<SOS>", "<EOS>", "<PAD>")]
+    return " ".join(words)
+
+def run_segmentation(pil_img):
+    seg_model = load_seg_model()
+    img = np.array(pil_img.convert("RGB"))
+    img_resized = np.array(pil_img.convert("RGB").resize((1152, 768), Image.NEAREST))
+    t = T.Compose([T.ToTensor(), T.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])])
+    inp = t(Image.fromarray(img_resized)).unsqueeze(0).to(device)
+    with torch.no_grad():
+        out = seg_model(inp)
+        mask = torch.argmax(F.softmax(out, dim=1), dim=1).cpu().squeeze(0).numpy()
+    # Normalize mask to 0-255 for display
+    mask_display = (mask / mask.max() * 255).astype(np.uint8) if mask.max() > 0 else mask.astype(np.uint8)
+    return img, mask_display
+
+def image_grid(image_paths, key_prefix, cols_per_row=7):
+    """Render thumbnail images in rows; return index of clicked one."""
+    selected = None
+    for row_start in range(0, len(image_paths), cols_per_row):
+        batch = image_paths[row_start:row_start + cols_per_row]
+        cols = st.columns(cols_per_row)
+        for i, (col, path) in enumerate(zip(cols, batch)):
+            img = Image.open(path)
+            col.image(img, use_container_width=True)
+            if col.button("Select", key=f"{key_prefix}_{row_start + i}"):
+                selected = row_start + i
+    return selected
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Image Captioning and Segmentation", layout="wide")
 st.title("Image Captioning and Segmentation")
 
-uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
+tab_cap, tab_seg = st.tabs(["🖼️ Image Captioning", "🎨 Image Segmentation"])
 
-if uploaded_file is not None:
-    # Display uploaded image
-    image = Image.open(uploaded_file).convert("RGB")
-    st.image(image, caption="Uploaded Image", use_column_width=True)
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 1 — Image Captioning
+# ════════════════════════════════════════════════════════════════════════════
+with tab_cap:
+    st.subheader("Image Captioning with Attention")
 
-    # Save to a temp file for OpenCV compatibility
-    temp_path = "temp_uploaded_image.png"
-    image.save(temp_path)
+    cap_img_paths = [os.path.join(CAP_SAMPLE, f) for f in list_images(CAP_SAMPLE)]
 
-    col1, col2 = st.columns(2)
+    # Upload
+    uploaded = st.file_uploader("Upload your own image", type=["jpg","jpeg","png"], key="cap_upload")
 
-    with col1:
-        if st.button("Generate Caption"):
-            with st.spinner("Generating caption..."):
-                caption = generate_caption(
-                    temp_path, encoder, decoder, word2idx, idx2word
-                )
-                st.success("Caption:")
-                st.write(caption)
+    cap_selected = image_grid(cap_img_paths, "cap")
 
-    with col2:
-        if st.button("Generate Segmentation"):
-            with st.spinner("Generating segmentation..."):
-                # Use matplotlib to get the output as an image
-                fig, ax = plt.subplots(figsize=(12, 5))
-                # Call the segmentation function but redirect plt to this fig
-                # We'll use the code from segment.py but adapt it for Streamlit
-                import cv2
+    # Resolve active image
+    cap_pil = None
+    if uploaded:
+        cap_pil = Image.open(io.BytesIO(uploaded.read()))
+    elif cap_selected is not None:
+        cap_pil = Image.open(cap_img_paths[cap_selected])
+        st.session_state["cap_pil"] = cap_pil
+    elif "cap_pil" in st.session_state:
+        cap_pil = st.session_state["cap_pil"]
 
-                image_bgr = cv2.imread(temp_path)
-                image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-                image_pil = Image.fromarray(image_rgb)
-                transform = image_transform if "image_transform" in globals() else None
-                if transform is None:
-                    from torchvision import transforms
-                    transform = transforms.Compose([
-                        transforms.Resize((256, 256)),
-                        transforms.ToTensor(),
-                    ])
-                input_tensor = transform(image_pil).unsqueeze(0).to(device)
-                seg_model.eval()
-                with torch.no_grad():
-                    output = seg_model(input_tensor)['out']
-                    pred_mask = torch.sigmoid(output).squeeze().cpu().numpy()
-                pred_mask_resized = cv2.resize(pred_mask, (image_rgb.shape[1], image_rgb.shape[0]))
-                binary_mask = (pred_mask_resized > 0.5).astype(np.uint8)
-                overlay = image_rgb.copy()
-                overlay[binary_mask == 1] = [0, 255, 0]
-                blended = cv2.addWeighted(image_rgb, 0.7, overlay, 0.3, 0)
-                # Show only the segmentation overlay
-                fig, ax = plt.subplots(figsize=(6, 5))
-                ax.imshow(blended)
-                ax.set_title("Prediction Overlay")
-                ax.axis("off")
-                st.pyplot(fig)
+    if cap_pil:
+        col1, col2 = st.columns([1, 2])
+        col1.image(cap_pil, caption="Selected Image", use_container_width=True)
+        with col2:
+            if st.button("Generate Caption", type="primary"):
+                with st.spinner("Generating caption…"):
+                    caption = run_caption(cap_pil)
+                st.success(f"**Caption:** {caption}")
 
-    # Remove temp file
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 2 — Image Segmentation
+# ════════════════════════════════════════════════════════════════════════════
+with tab_seg:
+    st.subheader("Semantic Segmentation (Drone Dataset)")
+
+    seg_img_paths = [os.path.join(SEG_SAMPLE, f) for f in list_images(SEG_SAMPLE)]
+
+    # Upload
+    seg_uploaded = st.file_uploader("Upload your own image", type=["jpg","jpeg","png"], key="seg_upload")
+
+    seg_selected = image_grid(seg_img_paths, "seg")
+
+    # Resolve active image
+    seg_pil = None
+    if seg_uploaded:
+        seg_pil = Image.open(io.BytesIO(seg_uploaded.read()))
+    elif seg_selected is not None:
+        seg_pil = Image.open(seg_img_paths[seg_selected])
+        st.session_state["seg_pil"] = seg_pil
+    elif "seg_pil" in st.session_state:
+        seg_pil = st.session_state["seg_pil"]
+
+    if seg_pil:
+        col1, col2, col3 = st.columns(3)
+        col1.image(seg_pil, caption="Original Image", use_container_width=True)
+        if col2.button("Run Segmentation", type="primary"):
+            with st.spinner("Segmenting…"):
+                original, mask = run_segmentation(seg_pil)
+            col2.image(original, caption="Preprocessed", use_container_width=True)
+            col3.image(mask, caption="Segmentation Mask", use_container_width=True, clamp=True)
